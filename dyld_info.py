@@ -5,7 +5,7 @@
 # Copyright 2010, KennyTM~ <kennytm@gmail.com>
 # Copyright 2014, espes
 #
-# Licensed under GPL version 3 or later
+# Licensed under GPL Version 3 or later
 #
 
 

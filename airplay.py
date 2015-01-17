@@ -1,21 +1,21 @@
 # airplay.py
 #
-# Copyright 2014, espes
+# Copyright 2015, espes
 #
-# Parts adapted from rtmp-livestreaming
-# Copyright 2014, Michael Liao
+# Parts adapted from Livestreamer
 #
-# Licensed under GPL Version 3 or later
+# Licensed under GPL Version 2 or later
 #
 
+import os
+import re
 import sys
-import time
-import select
 import socket
 import struct
 import threading
+import subprocess
 import SocketServer
-from collections import defaultdict, namedtuple, OrderedDict
+from collections import defaultdict, namedtuple
 from BaseHTTPServer import HTTPServer, BaseHTTPRequestHandler
 
 import biplist
@@ -26,64 +26,9 @@ from cryptography.hazmat.backends import default_backend
 
 import drm
 
-
-class BytesIO(object):
-    def __init__(self, data):
-        self._data = data
-        self._position = 0
-        self._length = len(data)
-
-    def read_uint8(self):
-        if self._position >= self._length:
-            raise IOError('EOF of BytesIO')
-        n = ord(self._data[self._position])
-        self._position += 1
-        return n
-
-    def read_uint16(self):
-        return (self.read_uint8() << 8) + self.read_uint8()
-
-    def read_uint24(self):
-        return ((self.read_uint8() << 16)
-            + (self.read_uint8() << 8)
-            + self.read_uint8())
-
-    def read_uint32(self):
-        return ((self.read_uint8() << 24)
-            + (self.read_uint8() << 16)
-            + (self.read_uint8() << 8)
-            + self.read_uint8())
-
-    def read_uint64(self):
-        return ((self.read_uint8() << 56)
-            + (self.read_uint8() << 48)
-            + (self.read_uint8() << 40)
-            + (self.read_uint8() << 32)
-            + (self.read_uint8() << 24)
-            + (self.read_uint8() << 16)
-            + (self.read_uint8() << 8)
-            + self.read_uint8())
-
-    def read_bytes(self, n):
-        if self._position + n > self._length:
-            raise IOError('Skip n bytes cause EOF.')
-        start = self._position
-        self._position = self._position + n
-        return self._data[start:self._position]
-
-    def available(self):
-        return self._length - self._position
-
-    def skip(self, n):
-        if self._position + n > self._length:
-            raise IOError('Skip n bytes cause EOF.')
-        self._position = self._position + n
-
-    def left(self):
-        return self._data[self._position:]
-
-    def __getitem__(self, key):
-        return self._data[key]
+import aac
+import mp4
+import mpegts
 
 
 class AirPlayMirroringVideoStream(object):
@@ -102,102 +47,63 @@ class AirPlayMirroringVideoStream(object):
         self.shutdown_request = False
         self.is_shutdown = threading.Event()
 
+        self.config_record = None
+
     def shutdown(self):
         self.shutdown_request = True
         self.is_shutdown.wait()
 
     def handle(self):
 
-        self.of = open("/tmp/vids.h264", "wb")
-
         while not self.shutdown_request:
             
             header = self.fd.read(128)
             if header == "": break
 
-            size, type_, unkn, timestamp = struct.unpack("<IHHB", header[:9])
+            size, type_, unkn, timestamp = struct.unpack("<IHHQ", header[:16])
+
+            # timestamp is a 64-bit ntp timestamp
+            timestamp = (timestamp >> 32) + float(timestamp & 0xffffffff) / 2**32
 
             data = self.fd.read(size)
             
             if type_ == 0: # video data
                 decrypted_data = self.decryptor.update(data)
+                
+                self.con.viewer.handle_h264_nalus(timestamp,
+                    list(self.parse_NALUs(decrypted_data)))
 
-                self._parse_NALUs(BytesIO(decrypted_data))
-            elif type_ == 1: # codec data
-                self._parse_config_record(BytesIO(data))
+            elif type_ == 1: # config record
+                self.config_record = mp4.AVCDecoderConfigurationRecord.parse(data)
+                
+                self.con.viewer.handle_h264_nalus(timestamp,
+                    self.config_record.sequenceParameterSetNALUnit
+                     + self.config_record.pictureParameterSetNALUnit)
 
             elif type_ == 2: # heartbeat
                 pass
             else:
                 print "wtf", size, type_, unkn, timestamp
 
-        self.of.close()
-
         self.is_shutdown.set()
 
-    def _parse_config_record(self, s):
-        """Parses H.264 AVCC extradata and writes it out as Annex B"""
+    def parse_NALUs(self, s):
+        assert self.config_record is not None
+        length_size = self.config_record.lengthSizeMinusOne + 1
+        assert 1 <= length_size <= 4
 
-        ver = s.read_uint8()
-        if ver != 1:
-            raise Exception('Bad config version in AVCDecoderConfigurationRecord: %d' % ver)
-
-        avc_profile_indication = s.read_uint8()
-        print 'profile:', avc_profile_indication
-
-        profile_compatibility = s.read_uint8()
-        avc_level_indication = s.read_uint8()
-        length_size_minus_one = s.read_uint8() & 0x03
-        print 'length_size_minus_one:', length_size_minus_one
-
-        num_of_sps = s.read_uint8() & 0x1f
-        print 'num_of_sps:', num_of_sps
-        for i in range(num_of_sps):
-            sps_length = s.read_uint16()
-            spsNALU = s.read_bytes(sps_length)
-            print 'spsNALU Length:', sps_length
-            print 'spsNALU:', hex(ord(spsNALU[0]))
-
-            self.of.write('\x00\x00\x00\x01')
-            self.of.write(spsNALU)
-
-        num_of_pps = s.read_uint8()
-        print 'num_of_pps:', num_of_pps
-        for i in range(num_of_pps):
-            pps_length = s.read_uint16()
-            ppsNALU = s.read_bytes(pps_length)
-            print 'ppsNALU Length:', pps_length
-            print 'ppsNALU:', hex(ord(ppsNALU[0]))
-            
-            self.of.write('\x00\x00\x00\x01')
-            self.of.write(ppsNALU)
-
-        self._nalu_length_size = length_size_minus_one + 1
-        print 'data available shoud be 0:', s.available()
-
-    def _parse_NALUs(self, s):
-        """Parses a series of H.264 AVCC NALUs and writes them out as Annex B"""
-
-        nalu_length_size = self._nalu_length_size
-
-        # split each NALUs and add '00000001' for each NALUs:
-        while s.available() > 0:
-            # the max value of nalu_length_size is 4 (=0x03 + 1)
-            length = 0
-            if nalu_length_size==4:
-                length = s.read_uint32()
-            elif nalu_length_size==3:
-                length = s.read_uint24()
-            elif nalu_length_size==2:
-                length = s.read_uint16()
-            else:
-                length = s.read_uint8()
-            
-            if s.available() < length:
+        i = 0
+        while i+length_size <= len(s):
+            length, = struct.unpack(">I", s[i:i+length_size].rjust(4, "\x00"))
+            i += length_size
+            nal = s[i:i+length];
+            i += length
+            if len(nal) < length:
                 raise Exception('bad NALU length: %d' % length)
 
-            self.of.write('\x00\x00\x00\x01')
-            self.of.write(s.read_bytes(length))
+            yield nal
+
+        assert i == len(s)
 
 
 class ThreadedHTTPServer(SocketServer.ThreadingMixIn, HTTPServer):
@@ -237,8 +143,8 @@ class AirPlayMirroringHTTPHandler(BaseHTTPRequestHandler):
         BaseHTTPRequestHandler.setup(self)
 
     def do_GET(self):
-        print `self.path`
-        print self.headers
+        # print `self.path`
+        # print self.headers
 
         if self.path == "/stream.xml":
             response = """<?xml version="1.0" encoding="UTF-8"?>
@@ -268,16 +174,18 @@ class AirPlayMirroringHTTPHandler(BaseHTTPRequestHandler):
             self.send_error(404)
 
     def do_POST(self):
-        print `self.path`
-        print self.headers
+        # print `self.path`
+        # print self.headers
 
         if self.path == "/fp-setup":
             chal_data = self.rfile.read(int(self.headers["Content-Length"]))
-            print "chal", `chal_data`
+            # print "chal", `chal_data`
 
+            print "Calculating AirPlay challenge stage %d..." % self.sap_stage
             response = self.sap.challenge(3, chal_data, self.sap_stage)
+            print "Done!"
             self.sap_stage += 1
-            print "resp", `response`
+            # print "resp", `response`
 
             self.send_response(200)
             self.send_header("Date", self.date_time_string())
@@ -295,13 +203,14 @@ class AirPlayMirroringHTTPHandler(BaseHTTPRequestHandler):
 
             bplist_data = self.rfile.read(int(self.headers["Content-Length"]))
             bplist = biplist.readPlistFromString(bplist_data)
-            print `bplist`
+            # print `bplist`
 
             assert bplist['deviceID'] == device_id
 
             iv = bplist['param2']
+            print "Decrypting AirPlay key..."
             key = self.sap.decrypt_key(bplist['param1'])
-            print "decrypted key!", `key`
+            print "Done! AirPlay key:", key.encode("hex")
 
             con.handle_mirroring_video_stream(self.rfile, key, iv)
             self.close_connection = 1
@@ -320,46 +229,25 @@ class AirTunesRTPDataHandler(SocketServer.BaseRequestHandler):
 
         hdrpieces = struct.unpack('!BBHII', packet[:12])
 
-        v = hdrpieces[0] >> 6
+        v = hdrpieces[0] >> 6 # Version
         assert v == 2
-        # Padding
-        p = bool(hdrpieces[0] & 32)
-        # Extension header present
-        x = bool(hdrpieces[0] & 16)
-        # CSRC Count
-        cc = bool(hdrpieces[0] & 15)
-        # Marker bit
-        marker = bool(hdrpieces[1] & 128)
-        # Payload type
-        pt = hdrpieces[1] & 127
-        # Sequence number
-        seq = hdrpieces[2]
-        # Timestamp
-        ts = hdrpieces[3]
+        p = bool(hdrpieces[0] & 32) # Padding
+        assert not p
+        x = bool(hdrpieces[0] & 16) # Extension header present
+        assert not x
+        cc = hdrpieces[0] & 15 # CSRC Count
+        assert cc == 0
+        marker = bool(hdrpieces[1] & 128) # Marker bit
+        pt = hdrpieces[1] & 127 # Payload type
+        seq = hdrpieces[2] # Sequence number
+        ts = hdrpieces[3] # Timestamp
         ssrc = hdrpieces[4]
-        headerlen = 12 + cc * 4
-        
-        # XXX throwing away csrc info for now
-        bytes = packet[headerlen:]
 
-        if x:
-            # Only one extension header
-            xhdrtype, xhdrlen = struct.unpack('!HH', bytes[:4])
-            xhdrdata = bytes[4:4+xhdrlen*4]
-            bytes = bytes[xhdrlen*4 + 4:]
-        else:
-            xhdrtype, xhdrdata = None, None
 
-        if p:
-            # padding
-            padlen = struct.unpack('!B', bytes[-1])[0]
-            if padlen:
-                bytes = bytes[:-padlen]
+        bytes = packet[12:]
 
         decrypted_bytes = self.server.rtp.cipher.decryptor().update(bytes)
         bytes = decrypted_bytes + bytes[len(decrypted_bytes):]
-
-        # print "-", bytes.encode("hex")
 
         self.server.rtp.handle_rtp_payload(ts, seq, bytes)
 
@@ -367,15 +255,50 @@ class AirTunesRTPDataHandler(SocketServer.BaseRequestHandler):
 
 class AirTunesRTPControlHandler(SocketServer.BaseRequestHandler):
     def handle(self):
-        print "RTP Control", self.request
+        # print "RTP Control", self.request
+
+        packet, sock = self.request
+        hdrpieces = struct.unpack('!BBHIQI', packet)
+
+        v = hdrpieces[0] >> 6 # Version
+        assert v == 2
+        p = bool(hdrpieces[0] & 32) # Padding
+        assert not p
+        x = bool(hdrpieces[0] & 16) # Extension header present
+        # assert not x
+        cc = hdrpieces[0] & 15 # CSRC Count
+        assert cc == 0
+        marker = bool(hdrpieces[1] & 128) # Marker bit
+        pt = hdrpieces[1] & 127 # Payload type
+        seq = hdrpieces[2] # Sequence number
+        ts = hdrpieces[3] # Timestamp
+
+        # no SSRC
+
+        ntp_ts = hdrpieces[4]
+        ts_next = hdrpieces[5]
+
+        ntp_ts = (ntp_ts >> 32) + float(ntp_ts & 0xffffffff) / 2**32
+
+        # given as seconds since 1900, adjust it to seconds since 1970
+        # maybe this'll make more sense when NTP is actualy implemented...
+        ntp_ts -= 2208988800
+
+        self.server.rtp.last_sync = (ts, ntp_ts)
+
+        # print ts, ntp_ts, ts_next
+
+
 
 class AirTunesRTPTimingHandler(SocketServer.BaseRequestHandler):
     def handle(self):
-        print "RTP Timing", self.request
+        pass
+        # print "RTP Timing", self.request
 
 class AirTunesRTPEventHandler(SocketServer.StreamRequestHandler):
     def handle(self):
-        print "RTP Event"
+        pass
+        # print "RTP Event"
 
 class AirTunesRTP(object):
     # Reading:
@@ -387,17 +310,21 @@ class AirTunesRTP(object):
 
         sdp_audio = sdp.media["audio"]
         assert sdp_audio.proto == "RTP/AVP"
-        assert sdp.fmtp[sdp_audio.fmt]["mode"] == "AAC-eld"
-        assert sdp.rtpmap[int(sdp_audio.fmt)].encoding == "mpeg4-generic"
+        audio_fmt = sdp.fmtp[sdp_audio.fmt]
+        assert audio_fmt["mode"] == "AAC-eld"
+        audio_map = sdp.rtpmap[int(sdp_audio.fmt)]
+        assert audio_map.encoding == "mpeg4-generic"
+
+        self.sample_rate = int(audio_map.clock)
+        self.channels = int(audio_map.parameters[0])
+        self.frame_duration = int(audio_fmt["constantDuration"])
 
         self.cipher = Cipher(algorithms.AES(key),
                              modes.CBC(iv),
                              backend=default_backend())
 
-        self.of = open("/tmp/aud1.mp4", "wb")
-
-        self.packet_queue = OrderedDict()
-
+        self.next_seq = None
+        self.last_sync = None
 
 
     def start(self, is_udp, cport, tport):
@@ -439,11 +366,21 @@ class AirTunesRTP(object):
 
     def handle_rtp_payload(self, ts, seq, payload):
 
-        if seq in self.packet_queue:
+        if self.next_seq is not None and seq < self.next_seq:
             return
-        self.packet_queue[seq] = (ts, payload)
 
-        # payload should be rfc3640 per spec, but looks like raw aac packets instead
+        if self.last_sync is not None:
+            sync_ts, sync_ntp_ts = self.last_sync
+
+            samples_since_sync = ts - sync_ts
+            seconds_since_sync = samples_since_sync / float(self.sample_rate)
+
+            timestamp = sync_ntp_ts + seconds_since_sync
+
+            self.con.viewer.handle_aac_frame(timestamp, payload)
+
+        self.next_seq = seq + 1
+
 
 
 
@@ -466,7 +403,7 @@ class SDP(object):
         self.fmtp = {}
 
         for line in s.strip().split("\r\n"):
-            print `line`
+            # print `line`
             key, value = line.split("=", 1)
 
             if key == "a":
@@ -532,17 +469,18 @@ class AirTunesRTSPHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
 
-        print `self.path`
-        print self.headers
+        # print `self.path`
+        # print self.headers
 
         if self.path == "/fp-setup":
             chal_data = self.rfile.read(int(self.headers["Content-Length"]))
+            # print "chal", `chal_data`
 
-            print "chal", `chal_data`
-
+            print "Calculating AirTunes challenge stage %d..." % self.sap_stage
             response = self.sap.challenge(2, chal_data, self.sap_stage)
+            print "Done!"
             self.sap_stage += 1
-            print "resp", `response`
+            # print "resp", `response`
 
             self.send_response(200)
             self.send_header("Content-Type", "application/octet-stream")
@@ -557,20 +495,21 @@ class AirTunesRTSPHandler(BaseHTTPRequestHandler):
             self.send_error(404)
 
     def do_ANNOUNCE(self):
-        print `self.path`
-        print self.headers
+        # print `self.path`
+        # print self.headers
 
         device_id = int(self.headers["X-Apple-Device-ID"], 16)
         con = self.server.parent.connections[device_id]
 
         sdp_str = self.rfile.read(int(self.headers["Content-Length"]))
-        print sdp_str
+        # print sdp_str
 
         sdp = SDP(sdp_str)
 
         iv = sdp.attrs["aesiv"].decode("base64")
+        print "Decrypting AirTunes key..."
         key = self.sap.decrypt_key(sdp.attrs["fpaeskey"].decode("base64"))
-        print "decrypted key!", `key`
+        print "Done! AirTunes key:", key.encode("hex")
 
         con.rtp = AirTunesRTP(con, self.path, sdp, key, iv)
 
@@ -590,14 +529,14 @@ class AirTunesRTSPHandler(BaseHTTPRequestHandler):
         return r
 
     def do_SETUP(self):
-        print `self.path`
-        print self.headers
+        # print `self.path`
+        # print self.headers
 
         device_id = int(self.headers["X-Apple-Device-ID"], 16)
         con = self.server.parent.connections[device_id]
 
         transport = self.parse_transport(self.headers["Transport"])
-        print transport
+        # print transport
 
         is_udp = "RTP/AVP/UDP" in transport
         con.rtp.start(is_udp, int(transport["control_port"]), int(transport["timing_port"]))
@@ -617,7 +556,7 @@ class AirTunesRTSPHandler(BaseHTTPRequestHandler):
             "event_port=%i" % event_port,
         ))
 
-        print `rtransport`
+        # print `rtransport`
 
         # why don't I get /audio and /video ???
 
@@ -629,6 +568,9 @@ class AirTunesRTSPHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_RECORD(self):
+        # print `self.path`
+        # print self.headers
+
         self.send_response(200)
         self.send_header("Server", self.version_string())
         self.send_header("CSeq", self.headers["CSeq"])
@@ -636,12 +578,12 @@ class AirTunesRTSPHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET_PARAMETER(self):
-        print `self.path`
-        print self.headers
+        # print `self.path`
+        # print self.headers
 
         parameter = self.rfile.read(int(self.headers["Content-Length"]))
 
-        print `parameter`
+        # print `parameter`
 
         parameter = parameter.strip()
 
@@ -656,11 +598,11 @@ class AirTunesRTSPHandler(BaseHTTPRequestHandler):
 
 
     def do_SET_PARAMETER(self):
-        print `self.path`
-        print self.headers
+        # print `self.path`
+        # print self.headers
 
         setting = self.rfile.read(int(self.headers["Content-Length"]))
-        print `setting`
+        # print `setting`
 
         self.send_response(200)
         self.send_header("Server", self.version_string())
@@ -682,6 +624,55 @@ class AirTunesRTSPHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
 
+
+
+class AirplayViewer(object):
+    def __init__(self, con):
+        self.con = con
+
+        self.vlc = self.find_vlc()
+        assert self.vlc
+
+        self.proc = subprocess.Popen([self.vlc, "--file-caching=3000", "-"],
+            stdin=subprocess.PIPE,
+            close_fds=True)
+
+        self.muxer = mpegts.TSMuxer(self.proc.stdin, True, True)
+        self.muxer.write_tables()
+
+
+    def check_paths(self, exes, paths):
+        for path in paths:
+            for exe in exes:
+                path = os.path.expanduser(os.path.join(path, exe))
+                if os.path.isfile(path):
+                    return path
+        return None
+
+    def find_vlc(self):
+        paths = os.environ.get("PATH", "").split(":")
+        if "darwin" in sys.platform:
+            paths += ["/Applications/VLC.app/Contents/MacOS/"]
+            paths += ["~/Applications/VLC.app/Contents/MacOS/"]
+            return self.check_paths(("VLC", "vlc"), paths)
+        else:
+            return self.check_paths(("vlc",), paths)
+
+    def handle_aac_frame(self, ts, frame):
+        # hax
+        channels = self.con.rtp.channels
+        sample_rate = self.con.rtp.sample_rate
+        frame_duration = self.con.rtp.frame_duration
+
+        packets = aac.latm_mux_aac_eld(channels, sample_rate, frame_duration, [frame])
+
+        self.muxer.mux_latm(ts, ''.join(packets))
+
+    def handle_h264_nalus(self, ts, nalus):
+        self.muxer.mux_h264(ts, ''.join('\x00\x00\x00\x01'+nalu for nalu in nalus))
+
+
+
 class AirplayConnection(object):
     def __init__(self, server):
         self.server = server
@@ -690,6 +681,8 @@ class AirplayConnection(object):
         self.mirroring_thread = None
 
         self.rtp = None
+        
+        self.viewer = AirplayViewer(self)
 
     def handle_mirroring_video_stream(self, fd, key, iv):
         self.mirroring_thread = threading.current_thread()
@@ -718,6 +711,7 @@ class AirplayServer(object):
         self.airplay_mirroring_port = 7100
 
         self.zc = None
+
         self.airplay_server = None
         self.airplay_mirroring_server = None
         self.airtunes_server = None
@@ -726,7 +720,7 @@ class AirplayServer(object):
 
         # usually a mac adress, but ceebs
         self.device_id = ("11", "22", "33", "44", "55", "66")
-        self.service_name = "lolol"
+        self.service_name = "Slave in the Magic Mirror"
 
         self.connections = defaultdict(lambda: AirplayConnection(self))
 
@@ -754,7 +748,7 @@ class AirplayServer(object):
                 'srcvers': u'120.2',
             }
         )
-        self.zc.registerService(info)
+        self.zc.register_service(info)
 
     def register_airtunes(self, port):
         # See https://nto.github.io/AirPlay.html#servicediscovery-airtunesservice
@@ -780,7 +774,7 @@ class AirplayServer(object):
                 'sf': u'0x4',
             }
         )
-        self.zc.registerService(info)
+        self.zc.register_service(info)
 
     def run(self):
 
@@ -802,14 +796,18 @@ class AirplayServer(object):
         self.airplay_mirroring_server.parent = self
         self.airtunes_server.parent = self
 
-        print 'Starting servers'
         self.airplay_thread = threading.Thread(
             target=self.airplay_server.serve_forever)
         self.airplay_mirroring_thread = threading.Thread(
             target=self.airplay_mirroring_server.serve_forever)
+        # self.airtunes_thead = threading.Thread(
+        #     target=self.airtunes_server.serve_forever)
 
         self.airplay_thread.start()
         self.airplay_mirroring_thread.start()
+        # self.airtunes_thead.start()
+
+        print 'Ready'
 
         try:
             self.airtunes_server.serve_forever()
@@ -819,14 +817,16 @@ class AirplayServer(object):
 
             self.airplay_server.shutdown()
             self.airplay_mirroring_server.shutdown()
+            # self.airtunes_server.shutdown()
 
             self.airplay_thread.join()
             self.airplay_mirroring_thread.join()
+            # self.airtunes_thead.join()
 
             self.zc.close()
 
 if __name__ == "__main__":
-    server = AirplayServer("airtunesd_44")
+    server = AirplayServer("airtunesd")
     server.run()
 
 

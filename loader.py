@@ -6,6 +6,7 @@
 #
 
 import sys
+import time
 import inspect
 
 from macholib import MachO
@@ -248,7 +249,7 @@ class IOSProcess(object):
 
         self.run(exit_addr)
 
-        print "we're done!", self.cpu.regs[0]
+        # print "we're done!", self.cpu.regs[0]
 
     def call(self, func, args):
         if func in self.symbols:
@@ -277,20 +278,20 @@ class IOSProcess(object):
         self.cpu.regs[15] = addr
         self.cpu.cpsr.m = 0b10000 # user mode
 
-        print self.cpu.regs
+        # print self.cpu.regs
         self.run(exit_addr)
 
-        print "we're done!", self.cpu.regs[0]
+        # print "we're done!", self.cpu.regs[0]
         return self.cpu.regs[0]
 
     def run(self, exit_addr=None):
         self.running = True
         cnt = 0
-        import time
+
         tt = time.time()
         while self.running:
             cnt += 1
-            if cnt % 100000 == 0: print cnt, cnt/(time.time()-tt)
+            # if cnt % 100000 == 0: print cnt, cnt/(time.time()-tt)
 
             self.cpu.branch_to = None
             pc = self.cpu.regs[15]
@@ -331,7 +332,7 @@ class IOSProcess(object):
             # print
             # print map(hex, self.cpu.regs)
             # raw_input()     
-        print "did %d instructions" % cnt   
+        # print "did %d instructions" % cnt   
 
 
 
