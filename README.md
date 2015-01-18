@@ -8,7 +8,7 @@ In short: Apple has a thing that lets you show what's on your iPhone or iPad or 
 
 This is an open-source implementation of [Apple AirPlay Mirroring](https://en.wikipedia.org/wiki/AirPlay#AirPlay_Mirroring)
 
-AirPlay Mirroring uses a funky mish-mash of standards wrapped in some DRM. The audio and video data is packed into a standard media container and handed to VLC. The DRM is handled by calling into the original AppleTV server binary using a pure-python ARM interpreter. 
+AirPlay Mirroring uses a funky mish-mash of standards wrapped in some DRM. *Slave in the Magic Mirror* packs the audio and video data into a standard media container and hands it to VLC. The DRM is handled by calling into the original Apple TV server binary using a pure-python ARM interpreter.
 
 It's not exactly production-ready, but try it out!
 
