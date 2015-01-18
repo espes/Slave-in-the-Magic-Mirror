@@ -24,7 +24,7 @@ You need:
 Then:
 
 ```
-pypy -m pip install construct biplist zeroconf cryptography
+pypy -m pip install biplist construct cryptography macholib zeroconf
 
 pypy airplay.py
 ```
