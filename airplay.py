@@ -10,6 +10,7 @@
 import os
 import re
 import sys
+import time
 import socket
 import struct
 import threading
@@ -137,7 +138,12 @@ class AirPlayMirroringHTTPHandler(BaseHTTPRequestHandler):
                              (self.protocol_version, code, message))
 
     def setup(self):
+        print "Initialising FairPlay SAP..."
+        st = time.clock()
         self.sap = drm.FairPlaySAP(self.server.parent.airtunesd_filename)
+        et = time.clock()
+        print "Done! Took %.2f seconds." % (et-st)
+
         self.sap_stage = 0
 
         BaseHTTPRequestHandler.setup(self)
@@ -182,8 +188,10 @@ class AirPlayMirroringHTTPHandler(BaseHTTPRequestHandler):
             # print "chal", `chal_data`
 
             print "Calculating AirPlay challenge stage %d..." % self.sap_stage
+            st = time.clock()
             response = self.sap.challenge(3, chal_data, self.sap_stage)
-            print "Done!"
+            et = time.clock()
+            print "Done! Took %.2f seconds." % (et-st)
             self.sap_stage += 1
             # print "resp", `response`
 
@@ -208,9 +216,12 @@ class AirPlayMirroringHTTPHandler(BaseHTTPRequestHandler):
             assert bplist['deviceID'] == device_id
 
             iv = bplist['param2']
+
             print "Decrypting AirPlay key..."
+            st = time.clock()
             key = self.sap.decrypt_key(bplist['param1'])
-            print "Done! AirPlay key:", key.encode("hex")
+            et = time.clock()
+            print "Done! Took %.2f seconds. AirPlay key: %s" % (et-st, key.encode("hex"))
 
             con.handle_mirroring_video_stream(self.rfile, key, iv)
             self.close_connection = 1
@@ -462,7 +473,11 @@ class AirTunesRTSPHandler(BaseHTTPRequestHandler):
         return "AirTunes/120.2"
 
     def setup(self):
+        print "Initialising FairPlay SAP..."
+        st = time.clock()
         self.sap = drm.FairPlaySAP(self.server.parent.airtunesd_filename)
+        et = time.clock()
+        print "Done! Took %.2f seconds." % (et-st)
         self.sap_stage = 0
 
         BaseHTTPRequestHandler.setup(self)
@@ -477,8 +492,10 @@ class AirTunesRTSPHandler(BaseHTTPRequestHandler):
             # print "chal", `chal_data`
 
             print "Calculating AirTunes challenge stage %d..." % self.sap_stage
+            st = time.clock()
             response = self.sap.challenge(2, chal_data, self.sap_stage)
-            print "Done!"
+            et = time.clock()
+            print "Done! Took %.2f seconds." % (et-st)
             self.sap_stage += 1
             # print "resp", `response`
 
@@ -507,9 +524,12 @@ class AirTunesRTSPHandler(BaseHTTPRequestHandler):
         sdp = SDP(sdp_str)
 
         iv = sdp.attrs["aesiv"].decode("base64")
+
         print "Decrypting AirTunes key..."
+        st = time.clock()
         key = self.sap.decrypt_key(sdp.attrs["fpaeskey"].decode("base64"))
-        print "Done! AirTunes key:", key.encode("hex")
+        et = time.clock()
+        print "Done! Took %.2f seconds. AirTunes key: %s" % (et-st, key.encode("hex"))
 
         con.rtp = AirTunesRTP(con, self.path, sdp, key, iv)
 
