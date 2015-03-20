@@ -37,6 +37,22 @@ BIND_OPCODE_DO_BIND_ADD_ADDR_IMM_SCALED = 0xB0
 BIND_OPCODE_DO_BIND_ULEB_TIMES_SKIPPING_ULEB = 0xC0
 
 
+REBASE_TYPE_POINTER = 1
+REBASE_TYPE_TEXT_ABSOLUTE32 = 2
+REBASE_TYPE_TEXT_PCREL32 = 3
+
+REBASE_OPCODE_MASK = 0xF0
+REBASE_IMMEDIATE_MASK = 0x0F
+REBASE_OPCODE_DONE = 0x00
+REBASE_OPCODE_SET_TYPE_IMM = 0x10
+REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB = 0x20
+REBASE_OPCODE_ADD_ADDR_ULEB = 0x30
+REBASE_OPCODE_ADD_ADDR_IMM_SCALED = 0x40
+REBASE_OPCODE_DO_REBASE_IMM_TIMES = 0x50
+REBASE_OPCODE_DO_REBASE_ULEB_TIMES = 0x60
+REBASE_OPCODE_DO_REBASE_ADD_ADDR_ULEB = 0x70
+REBASE_OPCODE_DO_REBASE_ULEB_TIMES_SKIPPING_ULEB = 0x80
+
 def readString(f):
     r = ""
     while True:
@@ -80,21 +96,61 @@ def readSLeb128(f):
     
     return res
 
+def read_rebases(f, size, segs, ptrwidth=4):
+    addr = 0
+    rebases = []
 
+    end = f.tell() + size
+    while f.tell() < end:
+        c = ord(f.read(1))
+        opcode = c & REBASE_OPCODE_MASK
+        imm = c & REBASE_IMMEDIATE_MASK
+
+        if opcode == REBASE_OPCODE_DONE:
+            pass
+        elif opcode == REBASE_OPCODE_SET_TYPE_IMM:
+            assert imm == REBASE_TYPE_POINTER
+        elif opcode == REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB:
+            addr = segs[imm].vmaddr + readULeb128(f)
+        elif opcode == REBASE_OPCODE_ADD_ADDR_ULEB:
+            addr = (addr + readULeb128(f)) % (2 ** 64)
+        elif opcode == REBASE_OPCODE_ADD_ADDR_IMM_SCALED:
+            addr += imm * ptrwidth
+        elif opcode == REBASE_OPCODE_DO_REBASE_IMM_TIMES:
+            for i in xrange(imm):
+                rebases.append(addr)
+                addr += ptrwidth
+        elif opcode == REBASE_OPCODE_DO_REBASE_ULEB_TIMES:
+            count = readULeb128(f)
+            for i in xrange(count):
+                rebases.append(addr)
+                addr += ptrwidth
+        elif opcode == REBASE_OPCODE_DO_REBASE_ADD_ADDR_ULEB:
+            rebases.append(addr)
+            addr += ptrwidth + readULeb128(f)
+        elif opcode == REBASE_OPCODE_DO_REBASE_ULEB_TIMES_SKIPPING_ULEB:
+            count = readULeb128(f)
+            skip = readULeb128(f)
+            for i in xrange(count):
+                rebases.append(addr)
+                addr += skip + ptrwidth
+        else:
+            raise NotImplementedError
+
+    return rebases
 
 def read_binds(f, size, segs, ptrwidth=4):
     libord = 0
     sym = None
     addr = 0
     
-    end = f.tell() + size
-    
     symbols = []
 
+    end = f.tell() + size
     while f.tell() < end:
         c = ord(f.read(1))
-        imm = c & BIND_IMMEDIATE_MASK
         opcode = c & BIND_OPCODE_MASK
+        imm = c & BIND_IMMEDIATE_MASK
 
         if opcode == BIND_OPCODE_DONE:
             pass
@@ -104,38 +160,29 @@ def read_binds(f, size, segs, ptrwidth=4):
             libord = readULeb128(f)
         elif opcode == BIND_OPCODE_SET_DYLIB_SPECIAL_IMM:
             libord = (imm | 0xf0) if imm else 0
-
         elif opcode == BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM:
             sym = readString(f)
-
         elif opcode == BIND_OPCODE_SET_TYPE_IMM:
-            pass
-
+            assert imm == BIND_TYPE_POINTER
         elif opcode == BIND_OPCODE_SET_ADDEND_SLEB:
             readSLeb128(f)
-
         elif opcode == BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB:
             addr = segs[imm].vmaddr + readULeb128(f)
-
         elif opcode == BIND_OPCODE_ADD_ADDR_ULEB:
             addr = (addr + readULeb128(f)) % (2 ** 64)
-
         elif opcode == BIND_OPCODE_DO_BIND:
             symbols.append((sym, addr, libord))
             addr += ptrwidth
-
         elif opcode == BIND_OPCODE_DO_BIND_ADD_ADDR_ULEB:
             symbols.append((sym, addr, libord))
             addr += ptrwidth + readULeb128(f)
-
         elif opcode == BIND_OPCODE_DO_BIND_ADD_ADDR_IMM_SCALED:
             symbols.append((sym, addr, libord))
             addr += (imm+1) * ptrwidth
-
         elif opcode == BIND_OPCODE_DO_BIND_ULEB_TIMES_SKIPPING_ULEB:
             count = readULeb128(f)
             skip = readULeb128(f)
-            for i in range(count):
+            for i in xrange(count):
                 symbols.append((sym, addr, libord))
                 addr += skip + ptrwidth
         else:
@@ -175,7 +222,8 @@ class DyldInfo(object):
             self.exports = []
 
             if cmd.rebase_size:
-                pass
+                f.seek(cmd.rebase_off)
+                self.rebases = read_rebases(f, cmd.rebase_size, segs)
 
             if cmd.bind_size:
                 f.seek(cmd.bind_off)

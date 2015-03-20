@@ -7,12 +7,16 @@
 
 import sys
 import time
+import struct
 import inspect
+import platform
+
+import mmap
+import ctypes
 
 from macholib import MachO
 from macholib.mach_o import *
 
-import arm
 from dyld_info import DyldInfo
 
 def align(p, a):
@@ -74,25 +78,168 @@ def load_macho(filename):
 
     #assert entry_point is not None
 
-
-    stack_bottom = 0x70000000 # ?
-    stack_size = 0x20000 # 128k ?
-    regions.append((stack_bottom-stack_size, stack_size, None))
-
     # print [(hex(a), hex(b), c[:16] if c else c) for a, b, c in regions]
 
-    return (regions, entry_point, stack_bottom,
-                symbols, dyld_info)
+    return (regions, entry_point, symbols, dyld_info)
 
-class IOSProcess(object):
+
+def arc4random():
+    return 4
+
+def umodsi3(a, b):
+    if b == 0:
+        return a
+    return a % b
+
+def modsi3(a, b):
+    return a - (a // b) * b
+
+def udivsi3(a, b):
+    return a // b
+
+class IOSProcessNative(object):
+    def __init__(self, filename):
+        self.filename = filename
+
+        self.libc = ctypes.CDLL("libc.so.6")
+
+        # setup a simple heap
+        heap_size = 0x200000 # 2MB
+        self.heap_buffer = mmap.mmap(-1, heap_size,
+            prot = mmap.PROT_READ | mmap.PROT_WRITE)
+        self.heap_data = (ctypes.c_byte * heap_size).from_buffer(self.heap_buffer)
+        self.heap_addr = ctypes.addressof(self.heap_data)
+        self.heap_base = self.heap_addr
+
+
+        # load in the program
+
+        (regions, self.entry_point, 
+            self.symbols, dyld_info) = load_macho(filename)
+
+        self.map_bottom = min(addr for addr, size, data in regions)
+        self.map_top = max(addr+size for addr, size, data in regions)
+
+        map_size = self.map_top-self.map_bottom
+
+        self.map_buffer = mmap.mmap(-1, map_size,
+            prot=mmap.PROT_READ | mmap.PROT_WRITE | mmap.PROT_EXEC)
+        assert self.map_buffer
+
+        for addr, size, data in regions:
+            if not data: data = "\x00"*size
+            self.map_buffer.seek(addr - self.map_bottom)
+            self.map_buffer.write(data)
+        self.map_buffer.seek(0)
+
+        self.map_data = (ctypes.c_ubyte * map_size).from_buffer(self.map_buffer)
+        self.map_addr = ctypes.addressof(self.map_data)
+
+        self.slide = self.map_addr - self.map_bottom
+
+        # apply relocations
+        for addr in dyld_info.rebases:
+            self.map_buffer.seek(addr - self.map_bottom)
+            ptr = struct.unpack("I", self.map_buffer.read(4))[0]
+            # print "reloc", hex(ptr)
+            assert self.map_bottom <= ptr <= self.map_top
+
+            self.map_buffer.seek(addr - self.map_bottom)
+            self.map_buffer.write(struct.pack("I", ptr + self.slide))
+
+        self.dummy_funcs = {}
+
+        self.hle_malloc_func = ctypes.CFUNCTYPE(
+            ctypes.c_int, ctypes.c_int)(self.malloc)
+        self.hle = {
+            '___stack_chk_guard': ctypes.pointer(self.hle_stack_chk_guard),
+            '_printf': self.libc.printf,
+            '_malloc': self.hle_malloc_func,
+            '_memcpy': self.libc.memcpy,
+            '_memset': self.libc.memset,
+            '_arc4random': self.hle_arc4random_func,
+            '___umodsi3': self.hle_umodsi3_func,
+            '___modsi3': self.hle_modsi3_func,
+            '___udivsi3': self.hle_udivsi3_func,
+        }
+
+        # apply bindings
+        for name, vmaddr, libord in dyld_info.binds+dyld_info.lazy_binds:
+            cobj = self.hle.get(name)
+            if not cobj:
+                cobj = self.dummy_func(name)
+
+            ptr = ctypes.cast(cobj, ctypes.c_void_p).value
+
+            self.map_buffer.seek(vmaddr - self.map_bottom)
+            self.map_buffer.write(struct.pack("I", ptr))
+
+    def dummy_func(self, name):
+        if name in self.dummy_funcs: return self.dummy_funcs[name]
+        def func():
+            print "no hle for %s!" % name
+            sys.exit(1)
+        self.dummy_funcs[name] = ctypes.CFUNCTYPE(ctypes.c_int)(func)
+        return self.dummy_funcs[name]
+
+
+    def malloc(self, size):
+        r = self.heap_base
+        self.heap_base += size
+        return r
+
+    def ld_word(self, addr):
+        return ctypes.c_int.from_address(addr).value
+
+    def st_word(self, addr, v):
+        ctypes.c_int.from_address(addr).value = v
+
+    def copyin(self, addr, data):
+        carr = (ctypes.c_ubyte * len(data)).from_address(addr)
+        carr[:] = map(ord, data)
+
+    def copyout(self, addr, length):
+        carr = (ctypes.c_ubyte * length).from_address(addr)
+        return ''.join(map(chr, carr[:]))
+
+    hle_stack_chk_guard = ctypes.c_int(0)
+
+    hle_arc4random_func = ctypes.CFUNCTYPE(ctypes.c_int)(arc4random)
+
+    hle_umodsi3_func = ctypes.CFUNCTYPE(
+        ctypes.c_uint, ctypes.c_uint, ctypes.c_uint)(umodsi3)
+
+    hle_modsi3_func = ctypes.CFUNCTYPE(
+        ctypes.c_uint, ctypes.c_int, ctypes.c_int)(modsi3)
+
+    hle_udivsi3_func = ctypes.CFUNCTYPE(
+        ctypes.c_uint, ctypes.c_uint, ctypes.c_uint)(udivsi3)
+
+
+    def call(self, func, args):
+        cfunc = ctypes.CFUNCTYPE(ctypes.c_int,
+            *([ctypes.c_int] * len(args)))(func + self.slide)
+        return cfunc(*args)
+
+    def exec_(self, arg=[], env=[]):
+
+        # cargs = (c_char_p * len(arg))(arg)
+        # cenv = (c_char_p * len(arg))(arg)
+
+        start = ctypes.CFUNCTYPE(ctypes.c_int)(
+            self.entry_point + self.slide)
+        start()
+
+
+class IOSProcessEmu(object):
     def __init__(self, filename):
         self.filename = filename
 
         self.hle = {
             '_printf': self.hle_printf,
+            '_malloc': self.hle_malloc,
             '_memcpy': self.hle_memcpy,
             '_memset': self.hle_memset,
-            '_malloc': self.hle_malloc,
             '_arc4random': self.hle_arc4random,
             '___umodsi3': self.hle_umodsi3,
             '___modsi3': self.hle_modsi3,
@@ -103,20 +250,24 @@ class IOSProcess(object):
         self.running = False
 
 
-
-        (regions, self.entry_point, self.stack_bottom,
+        (regions, self.entry_point, 
             self.symbols, dyld_info) = load_macho(filename)
 
-        # setup scratch space for putting down hooks for linking
-        scratch_addr = 0x80000000
-        scratch_size = 0x20000 # 128k
-        regions.append((scratch_addr, scratch_size, None))
+        # tmp hack of a stack
+        self.stack_bottom = 0x70000000 # ?
+        stack_size = 0x20000 # 128k ?
+        regions.append((self.stack_bottom-stack_size, stack_size, None))
 
         # tmp hack of a heap
         heap_addr = 0x40000000
         heap_size = 0x200000 # 2MB
         regions.append((heap_addr, heap_size, None))
         self.heap_base = heap_addr
+
+        # setup scratch space for putting down hooks for linking
+        scratch_addr = 0x80000000
+        scratch_size = 0x20000 # 128k
+        regions.append((scratch_addr, scratch_size, None))
 
         # setup memory
         self.mem = arm.memory.VirtualMemory()
@@ -150,7 +301,6 @@ class IOSProcess(object):
         self.options.enable_tracer = on
         self.options.enable_logger = on
 
-
     def copyin(self, addr, data):
         for i, c in enumerate(data):
             self.cpu.st_byte(addr+i, ord(c))
@@ -165,6 +315,12 @@ class IOSProcess(object):
         r = self.heap_base
         self.heap_base += size
         return r
+
+    def ld_word(self, addr):
+        return self.cpu.ld_word(addr)
+
+    def st_word(self, addr, v):
+        return self.cpu.st_word(addr, v)
 
     def make_hle(f):
         nargs = len(inspect.getargspec(f).args)-1
@@ -211,23 +367,21 @@ class IOSProcess(object):
 
     @make_hle
     def hle_arc4random(self):
-        return 4
+        return arc4random()
 
     @make_hle
     def hle_umodsi3(self, a, b):
-        if b == 0:
-            return a
-        return a % b
+        return umodsi3(a, b)
 
     @make_hle
     def hle_modsi3(self, a, b):
         a = arm.bitops.sint32(a)
         b = arm.bitops.sint32(b)
-        return a - (a // b) * b
+        return modsi3(a, b)
 
     @make_hle
     def hle_udivsi3(self, a, b):
-        return a // b
+        return udivsi3(a, b)
 
     def exec_(self, arg=[], env=[]):
         #todo: setup the stack...
@@ -335,6 +489,11 @@ class IOSProcess(object):
         # print "did %d instructions" % cnt   
 
 
+if platform.machine() == "armv7l" and platform.system() in ("Linux", "Darwin"):
+    IOSProcess = IOSProcessNative
+else:
+    import arm
+    IOSProcess = IOSProcessEmu
 
 if __name__ == "__main__":
     from sys import argv

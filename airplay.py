@@ -726,7 +726,7 @@ class AirplayServer(object):
     def __init__(self, airtunesd_filename=None):
         self.airtunesd_filename = airtunesd_filename
 
-        self.airtunes_port = 49152
+        # self.airtunes_port = 49152
         self.airplay_port = 7000
         self.airplay_mirroring_port = 7100
 
@@ -798,11 +798,6 @@ class AirplayServer(object):
 
     def run(self):
 
-        self.zc = zeroconf.Zeroconf()
-        self.register_airtunes(self.airtunes_port)
-        self.register_airplay(self.airplay_port)
-
-
         self.airplay_server = ThreadedHTTPServer(
             ('', self.airplay_port), AirPlayHTTPHandler)
 
@@ -810,7 +805,7 @@ class AirplayServer(object):
             ('', self.airplay_mirroring_port), AirPlayMirroringHTTPHandler)
 
         self.airtunes_server = ThreadedHTTPServer(
-            ('', self.airtunes_port), AirTunesRTSPHandler)
+            ('', 0), AirTunesRTSPHandler)
 
         self.airplay_server.parent = self
         self.airplay_mirroring_server.parent = self
@@ -826,6 +821,12 @@ class AirplayServer(object):
         self.airplay_thread.start()
         self.airplay_mirroring_thread.start()
         # self.airtunes_thead.start()
+
+        # register with bonjour
+        self.zc = zeroconf.Zeroconf()
+        self.register_airtunes(self.airtunes_server.server_port)
+        self.register_airplay(self.airplay_port)
+
 
         print 'Ready'
 

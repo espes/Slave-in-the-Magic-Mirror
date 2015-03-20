@@ -35,7 +35,7 @@ class FairPlaySAP(object):
         pSapInfo = self.p.malloc(4)
         self.p.call(self.fp_initsap, (pSapInfo, self.fpInfo))
 
-        self.sapInfo = self.p.cpu.ld_word(pSapInfo)
+        self.sapInfo = self.p.ld_word(pSapInfo)
 
     def challenge(self, type_, data, stage):
         if stage == 0:
@@ -54,7 +54,7 @@ class FairPlaySAP(object):
         p_out_length = self.p.malloc(4)
 
         p_inout_stage = self.p.malloc(4)
-        self.p.cpu.st_word(p_inout_stage, stage)
+        self.p.st_word(p_inout_stage, stage)
 
         r = self.p.call(self.fp_challenge,
                 (type_, self.fpInfo, self.sapInfo,
@@ -67,11 +67,11 @@ class FairPlaySAP(object):
 
         #assert r == 0
 
-        out_data = self.p.cpu.ld_word(p_out_data)
+        out_data = self.p.ld_word(p_out_data)
         # print "out_data", hex(out_data)
-        out_length = self.p.cpu.ld_word(p_out_length)
+        out_length = self.p.ld_word(p_out_length)
         # print "out_length", hex(out_length)
-        out_stage = self.p.cpu.ld_word(p_inout_stage)
+        out_stage = self.p.ld_word(p_inout_stage)
         # print "out_stage", out_stage
 
         if stage == 0:
@@ -95,11 +95,20 @@ class FairPlaySAP(object):
 
         assert r == 0
 
-        out_data = self.p.cpu.ld_word(p_out_data)
+        out_data = self.p.ld_word(p_out_data)
         # print "out_data", hex(out_data)
-        out_length = self.p.cpu.ld_word(p_out_length)
+        out_length = self.p.ld_word(p_out_length)
         # print "out_length", hex(out_length)
 
         assert out_length == 16
 
         return self.p.copyout(out_data, out_length)
+
+if __name__ == "__main__":
+    fp = FairPlaySAP()
+
+    print
+    print "Stage 0"
+    print
+    r0 = fp.challenge(2, "46504c590201010000000004020001bb".decode("hex"), 0)
+    print r0.encode("hex")
